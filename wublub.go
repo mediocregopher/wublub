@@ -52,6 +52,7 @@ type Wublub struct {
 	o             Opts
 	subscribed    map[string]bool
 	subUnsubCmdCh chan subUnsubCmd
+	closeCh       chan struct{}
 
 	// written to by the readSpin when it sees a subscribe or unsubscribe
 	// message, to let Run know that the command went through
@@ -62,7 +63,7 @@ type Wublub struct {
 	rLock  sync.RWMutex
 }
 
-// New initializes a Wublub instance and returns it. Run should be calld in
+// New initializes a Wublub instance and returns it. Run should be called in
 // order for the instance to actually do work.
 func New(o Opts) *Wublub {
 	if o.Timeout == 0 {
@@ -72,9 +73,16 @@ func New(o Opts) *Wublub {
 		o:              o,
 		subscribed:     map[string]bool{},
 		subUnsubCmdCh:  make(chan subUnsubCmd),
+		closeCh:        make(chan struct{}),
 		readSubUnsubCh: make(chan struct{}),
 		router:         map[string]map[chan<- Publish]bool{},
 	}
+}
+
+// Close stops all of Wublub's running go-routines and cleans up all of its
+// state. Note that Close will not Empty Wublub's pool.
+func (w *Wublub) Close() {
+	close(w.closeCh)
 }
 
 // Subscribe registers the given chan to receive Publishes from the given
@@ -197,6 +205,8 @@ func (w *Wublub) doUnsub(rc *rclient, channels []string, doneCh chan struct{}) e
 // connection from the pool to use and block indefinitely, until an error is hit
 // and returned. From there it is at the user's discretion to decide what to do,
 // but it is recommended to simply call Run again on an error.
+//
+// Will return nil if Close is called.
 func (w *Wublub) Run() error {
 	rc, err := w.getRClient()
 	if err != nil {
@@ -240,6 +250,8 @@ func (w *Wublub) Run() error {
 			}
 		case err := <-w.readErrCh:
 			return err
+		case <-w.closeCh:
+			return nil
 		}
 	}
 }

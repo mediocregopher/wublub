@@ -12,18 +12,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+var testPool *pool.Pool
 var testW *Wublub
 
 func init() {
-	p, err := pool.New("tcp", "127.0.0.1:6379", 5)
-	if err != nil {
+	var err error
+	if testPool, err = pool.New("tcp", "127.0.0.1:6379", 5); err != nil {
 		panic(err)
 	}
 
 	log.Printf("making new wublub")
-	testW = New(Opts{Pool: p})
+	testW = New(nil)
 	go func() {
-		panic(testW.Run())
+		panic(testW.Run("tcp", "127.0.0.1:6379"))
 	}()
 	log.Printf("done initializing")
 }
@@ -44,7 +45,7 @@ func TestUnderLoad(t *T) {
 					Message: testutil.RandStr(),
 				}
 				testW.Subscribe(readCh, p.Channel)
-				require.Nil(t, testW.Publish(p))
+				require.Nil(t, testPool.Cmd("PUBLISH", p.Channel, p.Message).Err)
 				p2 := <-readCh
 				assert.Equal(t, p, p2)
 				testW.Unsubscribe(readCh, p.Channel)

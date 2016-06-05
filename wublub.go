@@ -1,8 +1,6 @@
-// Package wublub implements a general purpose pubsub system backed by redis.
-// Arbitrary messages can be sent to arbitrarily named channels, and routines
-// subscribed to those channels can receive those messages. To wublub instances
-// can operate in tandem, even from different boxes, as long as they're sharing
-// the same redis instance or a redis instance in the same cluster.
+// Package wublub implements a layer on top of redis subscriptions. Wublub
+// clients can subscribe to arbitrary redis channels, whose publishes will be
+// written to a channel the client passes in.
 package wublub
 
 import (
@@ -10,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mediocregopher/radix.v2/pool"
 	"github.com/mediocregopher/radix.v2/redis"
 )
 
@@ -24,12 +21,8 @@ type Publish struct {
 // Opts are the options which can be passed in when initializing a Wublub
 // instance using New.
 type Opts struct {
-	// Required. A pool of redis connections to use
-	*pool.Pool
-
 	// Optional. Timeout to use when reading/writing subscription information to
-	// redis. This happens separately from the pool, so a different value than
-	// the pool's timeout value is used. Defaults to 5 seconds.
+	// redis. Defaults to 5 seconds.
 	Timeout time.Duration
 
 	// Optional. If false, when a publish occurs and is attempted to be written
@@ -54,28 +47,28 @@ type Wublub struct {
 	subUnsubCmdCh chan subUnsubCmd
 	closeCh       chan struct{}
 
-	// written to by the readSpin when it sees a subscribe or unsubscribe
-	// message, to let Run know that the command went through
-	readSubUnsubCh chan struct{}
-	readErrCh      chan error
+	// set in Run, should only be used within the goroutine calling Run
+	rs *readSpinner
 
 	router map[string]map[chan<- Publish]bool
 	rLock  sync.RWMutex
 }
 
 // New initializes a Wublub instance and returns it. Run should be called in
-// order for the instance to actually do work.
-func New(o Opts) *Wublub {
+// order for the instance to actually do work. Opts may be nil
+func New(o *Opts) *Wublub {
+	if o == nil {
+		o = &Opts{}
+	}
 	if o.Timeout == 0 {
 		o.Timeout = 5 * time.Second
 	}
 	return &Wublub{
-		o:              o,
-		subscribed:     map[string]bool{},
-		subUnsubCmdCh:  make(chan subUnsubCmd),
-		closeCh:        make(chan struct{}),
-		readSubUnsubCh: make(chan struct{}),
-		router:         map[string]map[chan<- Publish]bool{},
+		o:             *o,
+		subscribed:    map[string]bool{},
+		subUnsubCmdCh: make(chan subUnsubCmd),
+		closeCh:       make(chan struct{}),
+		router:        map[string]map[chan<- Publish]bool{},
 	}
 }
 
@@ -130,33 +123,10 @@ func (w *Wublub) Unsubscribe(ch chan<- Publish, channels ...string) {
 	<-doneCh
 }
 
-// Publish publishes the given message to the channel in the Publish
-func (w *Wublub) Publish(p Publish) error {
-	return w.o.Cmd("PUBLISH", p.Channel, p.Message).Err
-}
-
-func (w *Wublub) getRClient() (*rclient, error) {
-	// We only pull a connection out of the pool to get its address. We don't
-	// actually use it. This is kind of a hack, but since each conncetion in the
-	// pool may have a different address it's unfortunately necessary.
-	dummyc, err := w.o.Get()
-	if err != nil {
-		return nil, err
-	}
-	network, addr := dummyc.Network, dummyc.Addr
-	w.o.Put(dummyc)
-
-	conn, err := net.DialTimeout(network, addr, w.o.Timeout)
-	if err != nil {
-		return nil, err
-	}
-	return newRClient(conn, w.o.Timeout), nil
-}
-
 func (w *Wublub) confirmCmdRead() error {
 	select {
-	case <-w.readSubUnsubCh:
-	case err := <-w.readErrCh:
+	case <-w.rs.subUnsubCh:
+	case err := <-w.rs.errCh:
 		return err
 	}
 	return nil
@@ -201,23 +171,35 @@ func (w *Wublub) doUnsub(rc *rclient, channels []string, doneCh chan struct{}) e
 }
 
 // Run does the actual work of subscribing to redis channels and reading
-// publishes of them. This must be called in order to use Wublub. It will take a
-// connection from the pool to use and block indefinitely, until an error is hit
-// and returned. From there it is at the user's discretion to decide what to do,
-// but it is recommended to simply call Run again on an error.
+// publishes of them. This must be called in order to use Wublub. It will create
+// a new connection and block until an error is hit and returned. From there it
+// is at the user's discretion to decide what to do, but it is recommended to
+// simply call Run again on an error.
+//
+// When an error is hit, all subscribed channels will continue to be subscribed,
+// they don't have to do anything. Subsequent calls to Run will pick up where
+// the previous ones left off.
 //
 // Will return nil if Close is called.
-func (w *Wublub) Run() error {
-	rc, err := w.getRClient()
+func (w *Wublub) Run(network, addr string) error {
+	conn, err := net.DialTimeout(network, addr, w.o.Timeout)
 	if err != nil {
 		return err
 	}
-	defer rc.c.Close()
+	defer conn.Close()
+	rc := newRClient(conn, w.o.Timeout)
 
-	// always reset readErrCh, in case there was a previous Run which had an
-	// error which was never read off
-	w.readErrCh = make(chan error, 1)
-	go w.readSpin(rc)
+	runStopCh := make(chan struct{})
+	defer close(runStopCh)
+
+	w.rs = &readSpinner{
+		rc:         rc,
+		errCh:      make(chan error, 1),
+		subUnsubCh: make(chan struct{}),
+		runStopCh:  runStopCh,
+		w:          w,
+	}
+	go w.rs.spin()
 
 	// It's possible that this isn't the first Run, so we have to re-subscribe
 	// to all the previous channels before we can start serving actual requests
@@ -248,7 +230,7 @@ func (w *Wublub) Run() error {
 			if err != nil {
 				return err
 			}
-		case err := <-w.readErrCh:
+		case err := <-w.rs.errCh:
 			return err
 		case <-w.closeCh:
 			return nil
@@ -256,9 +238,26 @@ func (w *Wublub) Run() error {
 	}
 }
 
-func (w *Wublub) readSpin(rc *rclient) {
+type readSpinner struct {
+	rc *rclient
+	// the reader will write to errCh if it encounters any errors and
+	// immediately exit. Should be buffered by at least 1
+	errCh chan error
+	// the reader will write to subUnsubCh when it reads off a sub/unsub
+	// confirmation message
+	subUnsubCh chan struct{}
+	// Run will close runStopCh when it's returning and therefore no longer
+	// reading/writing these other channels
+	runStopCh chan struct{}
+
+	// the wublub instance running this, needed to access the router for pushing
+	// publishes to
+	w *Wublub
+}
+
+func (rs *readSpinner) spin() {
 	for {
-		r := rc.read()
+		r := rs.rc.read()
 		if r.Err != nil {
 			if redis.IsTimeout(r) {
 				continue
@@ -272,16 +271,20 @@ func (w *Wublub) readSpin(rc *rclient) {
 
 		arr, err := r.Array()
 		if err != nil {
-			w.readErrCh <- err
+			rs.errCh <- err
 			return
 		}
 
 		typ, err := arr[0].Str()
 		if err != nil {
-			w.readErrCh <- err
+			rs.errCh <- err
 			return
 		} else if typ == "subscribe" || typ == "unsubscribe" {
-			w.readSubUnsubCh <- struct{}{}
+			select {
+			case <-rs.runStopCh:
+				return
+			case rs.subUnsubCh <- struct{}{}:
+			}
 			continue
 		} else if typ != "message" {
 			continue
@@ -289,13 +292,13 @@ func (w *Wublub) readSpin(rc *rclient) {
 
 		channel, err := arr[1].Str()
 		if err != nil {
-			w.readErrCh <- err
+			rs.errCh <- err
 			return
 		}
 
 		message, err := arr[2].Str()
 		if err != nil {
-			w.readErrCh <- err
+			rs.errCh <- err
 			return
 		}
 
@@ -304,9 +307,18 @@ func (w *Wublub) readSpin(rc *rclient) {
 			Message: message,
 		}
 
-		w.rLock.RLock()
-		for ch := range w.router[channel] {
-			if w.o.BlockOnPublish {
+		// Check if the Run is still going before we do any publishing. This
+		// probably isn't a 100% guard against race-conditions, but it's
+		// something.
+		select {
+		case <-rs.runStopCh:
+			return
+		default:
+		}
+
+		rs.w.rLock.RLock()
+		for ch := range rs.w.router[channel] {
+			if rs.w.o.BlockOnPublish {
 				ch <- p
 			} else {
 				select {
@@ -315,6 +327,6 @@ func (w *Wublub) readSpin(rc *rclient) {
 				}
 			}
 		}
-		w.rLock.RUnlock()
+		rs.w.rLock.RUnlock()
 	}
 }

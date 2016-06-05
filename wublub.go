@@ -45,7 +45,6 @@ type Wublub struct {
 	o             Opts
 	subscribed    map[string]bool
 	subUnsubCmdCh chan subUnsubCmd
-	closeCh       chan struct{}
 
 	// set in Run, should only be used within the goroutine calling Run
 	rs *readSpinner
@@ -67,15 +66,8 @@ func New(o *Opts) *Wublub {
 		o:             *o,
 		subscribed:    map[string]bool{},
 		subUnsubCmdCh: make(chan subUnsubCmd),
-		closeCh:       make(chan struct{}),
 		router:        map[string]map[chan<- Publish]bool{},
 	}
-}
-
-// Close stops all of Wublub's running go-routines and cleans up all of its
-// state. Note that Close will not Empty Wublub's pool.
-func (w *Wublub) Close() {
-	close(w.closeCh)
 }
 
 // Subscribe registers the given chan to receive Publishes from the given
@@ -180,8 +172,9 @@ func (w *Wublub) doUnsub(rc *rclient, channels []string, doneCh chan struct{}) e
 // they don't have to do anything. Subsequent calls to Run will pick up where
 // the previous ones left off.
 //
-// Will return nil if Close is called.
-func (w *Wublub) Run(network, addr string) error {
+// stopCh is optional, and may be closed at any time to stop the Run and close
+// the connection to redis it created. Run will return nil if this occurs
+func (w *Wublub) Run(network, addr string, stopCh chan struct{}) error {
 	conn, err := net.DialTimeout(network, addr, w.o.Timeout)
 	if err != nil {
 		return err
@@ -232,7 +225,7 @@ func (w *Wublub) Run(network, addr string) error {
 			}
 		case err := <-w.rs.errCh:
 			return err
-		case <-w.closeCh:
+		case <-stopCh:
 			return nil
 		}
 	}

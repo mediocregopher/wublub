@@ -24,7 +24,7 @@ func init() {
 	log.Printf("making new wublub")
 	testW = New(nil)
 	go func() {
-		panic(testW.Run("tcp", "127.0.0.1:6379"))
+		panic(testW.Run("tcp", "127.0.0.1:6379", nil))
 	}()
 	log.Printf("done initializing")
 }
